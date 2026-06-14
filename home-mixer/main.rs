@@ -1,78 +1,63 @@
-use clap::Parser;
-use log::info;
 use std::time::Duration;
 
-use tonic::codec::CompressionEncoding;
-use tonic::service::RoutesBuilder;
-use tonic_reflection::server::Builder;
-
-use xai_home_mixer_proto as pb;
-use xai_http_server::{CancellationToken, GrpcConfig, HttpServer};
-
-use xai_home_mixer::HomeMixerServer;
+use clap::Parser;
+use xai_dark_traffic::RejectDarkTrafficLayer;
+use xai_home_mixer::dark_traffic_setup;
 use xai_home_mixer::params;
+use xai_home_mixer::{HomeMixerConfig, HomeMixerServer};
+use xai_home_mixer_proto as pb;
+use xai_x_rpc::grpc_client::TlsMode;
+use xai_x_rpc::wily_lookup_service::ShardCoordinate;
+use xai_x_service_builder::XServiceBuilder;
 
 #[derive(Parser, Debug)]
 #[command(about = "HomeMixer gRPC Server")]
 struct Args {
-    #[arg(long)]
+    #[arg(long, default_value_t = 50051u16)]
     grpc_port: u16,
-    #[arg(long)]
+    #[arg(long, default_value_t = 9090u16)]
     metrics_port: u16,
-    #[arg(long)]
-    reload_interval_minutes: u64,
-    #[arg(long)]
-    chunk_size: usize,
+    #[arg(long, default_value_t = -1)]
+    shard_coordinate: i16,
+    #[arg(long, default_value_t = 500)]
+    shard_total_size: u16,
+    #[arg(long, default_value = "atla")]
+    datacenter: String,
+    #[arg(long, default_value = "")]
+    otel_endpoint: String,
 }
 
-#[xai_stats_macro::main(name = "home-mixer")]
+fn parse_shard(args: &Args) -> Option<ShardCoordinate> {
+    if args.shard_coordinate >= 0 {
+        Some(ShardCoordinate {
+            ordinal: args.shard_coordinate as u16,
+            total_size: args.shard_total_size,
+        })
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    xai_init_utils::init().log();
-    xai_init_utils::init().rustls();
-    info!(
-        "Starting server with gRPC port: {}, metrics port: {}, reload interval: {} minutes, chunk size: {}",
-        args.grpc_port, args.metrics_port, args.reload_interval_minutes, args.chunk_size,
-    );
+    let shard_coordinate = parse_shard(&args);
 
-    // Create the service implementation
-    let service = HomeMixerServer::new().await;
-    // Keep a reference to stats_receiver before service is moved
-    let reflection_service = Builder::configure()
-        .register_encoded_file_descriptor_set(pb::FILE_DESCRIPTOR_SET)
-        .build_v1()?;
+    xai_stringcenter::init_from_file(params::STRINGCENTER_BUNDLE_PATH);
 
-    let mut grpc_routes = RoutesBuilder::default();
-
-    grpc_routes.add_service(
-        pb::scored_posts_service_server::ScoredPostsServiceServer::new(service)
-            .max_decoding_message_size(params::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(params::MAX_GRPC_MESSAGE_SIZE)
-            .accept_compressed(CompressionEncoding::Gzip)
-            .accept_compressed(CompressionEncoding::Zstd)
-            .send_compressed(CompressionEncoding::Gzip)
-            .send_compressed(CompressionEncoding::Zstd),
-    );
-
-    grpc_routes.add_service(reflection_service);
-
-    let grpc_config = GrpcConfig::new(args.grpc_port, grpc_routes.routes());
-
-    let http_router = axum::Router::default();
-
-    let mut server = HttpServer::new(
-        args.metrics_port,
-        http_router,
-        Some(grpc_config),
-        CancellationToken::new(),
-        Duration::from_secs(20),
-    )
-    .await?;
-
-    server.set_readiness(true);
-    info!("Server ready");
-    server.wait_for_termination().await;
-    info!("Server shutdown complete");
-    Ok(())
+    XServiceBuilder::new("home-mixer")
+        .grpc_port(args.grpc_port)
+        .metrics_port(args.metrics_port)
+        .datacenter(args.datacenter)
+        .otel_endpoint(args.otel_endpoint)
+        .with_featureswitches(params::FS_PATH, true)
+        .with_decider(params::decider_path(), None)
+        .with_tls(TlsMode::server_mtls_from_env()?)
+        .with_max_connection_age(Duration::from_secs(300))
+        .with_reflection(pb::FILE_DESCRIPTOR_SET)
+        .with_layer(dark_traffic_setup::resolve_layer())
+        .with_layer(RejectDarkTrafficLayer::from_env())
+        .http_routes(xai_profiling::profiling_router())
+        .run::<HomeMixerServer>(HomeMixerConfig { shard_coordinate })
+        .await
 }

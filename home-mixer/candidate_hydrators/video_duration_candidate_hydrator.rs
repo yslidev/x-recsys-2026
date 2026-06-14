@@ -1,62 +1,85 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::candidate_features::MediaInfo;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
 use crate::clients::tweet_entity_service_client::TESClient;
+use crate::models::candidate::{CandidateHelpers, PostCandidate};
+use crate::models::query::ScoredPostsQuery;
 use std::sync::Arc;
 use tonic::async_trait;
-use xai_candidate_pipeline::hydrator::Hydrator;
+use xai_candidate_pipeline::component_library::utils::{MokaCache, default_moka_cache};
+use xai_candidate_pipeline::hydrator::{CacheStore, CachedHydrator};
 
 pub struct VideoDurationCandidateHydrator {
     pub tes_client: Arc<dyn TESClient + Send + Sync>,
+    pub cache: MokaCache<u64, Option<i32>>,
 }
 
 impl VideoDurationCandidateHydrator {
     pub async fn new(tes_client: Arc<dyn TESClient + Send + Sync>) -> Self {
-        Self { tes_client }
+        let cache = default_moka_cache();
+        Self { tes_client, cache }
     }
 }
 
 #[async_trait]
-impl Hydrator<ScoredPostsQuery, PostCandidate> for VideoDurationCandidateHydrator {
-    #[xai_stats_macro::receive_stats]
-    async fn hydrate(
+impl CachedHydrator<ScoredPostsQuery, PostCandidate> for VideoDurationCandidateHydrator {
+    type CacheKey = u64;
+
+    type CacheValue = Option<i32>;
+
+    fn enable(&self, query: &ScoredPostsQuery) -> bool {
+        !query.has_cached_posts
+    }
+
+    fn cache_store(&self) -> &dyn CacheStore<Self::CacheKey, Self::CacheValue> {
+        &self.cache
+    }
+    fn cache_key(&self, candidate: &PostCandidate) -> Self::CacheKey {
+        candidate.get_original_tweet_id()
+    }
+
+    fn cache_value(&self, hydrated: &PostCandidate) -> Self::CacheValue {
+        hydrated.min_video_duration_ms
+    }
+
+    fn hydrate_from_cache(&self, value: Self::CacheValue) -> PostCandidate {
+        PostCandidate {
+            min_video_duration_ms: value,
+            ..Default::default()
+        }
+    }
+
+    async fn hydrate_from_client(
         &self,
         _query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Result<Vec<PostCandidate>, String> {
+    ) -> Vec<Result<PostCandidate, String>> {
         let client = &self.tes_client;
 
-        let tweet_ids = candidates.iter().map(|c| c.tweet_id).collect::<Vec<_>>();
+        let tweet_ids: Vec<u64> = candidates
+            .iter()
+            .map(|c| c.get_original_tweet_id())
+            .collect();
 
-        let post_features = client.get_tweet_media_entities(tweet_ids.clone()).await;
-        let post_features = post_features.map_err(|e| e.to_string())?;
+        let durations = client.get_min_video_durations(tweet_ids.clone()).await;
 
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
         for tweet_id in tweet_ids {
-            let post_features = post_features.get(&tweet_id);
-            let media_entities = post_features.and_then(|x| x.as_ref());
-
-            let video_duration_ms = media_entities.and_then(|entities| {
-                entities.iter().find_map(|entity| {
-                    if let Some(MediaInfo::VideoInfo(video_info)) = &entity.media_info {
-                        Some(video_info.duration_millis)
-                    } else {
-                        None
-                    }
-                })
-            });
-
-            let hydrated = PostCandidate {
-                video_duration_ms,
-                ..Default::default()
+            let hydrated = match durations.get(&tweet_id) {
+                Some(Ok(min_video_duration_ms)) => Ok(PostCandidate {
+                    min_video_duration_ms: min_video_duration_ms.map(|v| v as i32),
+                    ..Default::default()
+                }),
+                None => Err(format!(
+                    "Missing min video duration for tweet_id={}",
+                    tweet_id
+                )),
+                Some(Err(err)) => Err(err.to_string()),
             };
             hydrated_candidates.push(hydrated);
         }
 
-        Ok(hydrated_candidates)
+        hydrated_candidates
     }
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
-        candidate.video_duration_ms = hydrated.video_duration_ms;
+        candidate.min_video_duration_ms = hydrated.min_video_duration_ms;
     }
 }

@@ -24,6 +24,12 @@ Phoenix is a recommendation system that predicts user engagement (likes, reposts
 1. **Retrieval**: Efficiently narrow down millions of candidates to hundreds using approximate nearest neighbor (ANN) search
 2. **Ranking**: Score and order the retrieved candidates using a more expressive transformer model
 
+### About This Release
+
+- **Smaller model**: This is a mini version of the Phoenix model (128-dim, 4-layer transformer) trained on the same real-time engagement data as the production system. Production uses a larger model with more layers and wider embeddings.
+- **Frozen checkpoint**: Production Phoenix is trained continuously on real-time data. This release is a frozen checkpoint from that continuous training process — a snapshot at a point in time.
+- **Sports corpus**: The included retrieval corpus (`sports_corpus.npz`) contains ~537K sports-related post IDs from a 6-hour window, filtered by the "Sports" topic. This serves as a demo corpus for the retrieval stage.
+
 ---
 
 ## Architecture
@@ -185,19 +191,80 @@ Output: [B, num_candidates, num_actions]
 
 ### Installation
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
-
-### Running the Ranker
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then install dependencies:
 
 ```shell
-uv run run_ranker.py
+uv sync
 ```
 
-### Running Retrieval
+Or with pip:
 
 ```shell
-uv run run_retrieval.py
+pip install jax jaxlib dm-haiku numpy
 ```
+
+### Running the End-to-End Pipeline
+
+The pipeline runs retrieval followed by ranking on a pre-built sports corpus using exported model artifacts.
+
+#### 1. Download and extract artifacts
+
+Download `oss-phoenix-artifacts.zip` from the `phoenix/artifacts/` directory (stored via Git LFS), then extract:
+
+```shell
+cd phoenix
+unzip artifacts/oss-phoenix-artifacts.zip -d artifacts/
+```
+
+This creates `artifacts/oss-phoenix-artifacts/` containing:
+
+```
+oss-phoenix-artifacts/
+  retrieval/
+    model_params.npz          # Retrieval transformer + candidate tower weights (3 MB)
+    embedding_tables.npz      # User/item/author hash embeddings, 1M each (1.4 GB)
+    config.json               # Model config + hash function parameters
+  ranker/
+    model_params.npz          # Ranking transformer + action head weights (3 MB)
+    embedding_tables.npz      # User/item/author hash embeddings, 1M each (1.4 GB)
+    config.json               # Model config + hash function parameters
+  sports_corpus.npz           # 537K sports posts with pre-computed candidate representations
+  example_sequence.json       # Example user action history (3 posts: NFL, NBA, NHL)
+```
+
+#### 2. Run the pipeline
+
+```shell
+uv run run_pipeline.py --artifacts_dir artifacts/oss-phoenix-artifacts
+```
+
+This will:
+1. Load the retrieval and ranking models from the exported checkpoints
+2. Load the example user history (3 sports posts the user liked and dwelled on)
+3. **Retrieve** the top-200 most relevant posts from the 537K sports corpus using dot-product similarity
+4. **Rank** the retrieved posts by predicted engagement (favorite, reply, repost, dwell, video view)
+5. Print the final ranked list with per-action engagement probabilities
+
+#### 3. Customize
+
+- **Change the user history**: Edit `example_sequence.json` to add your own post interactions. Each history item needs a `post_id`, `author_id`, and `actions` (action index to value mapping). Action indices follow the proto `ActionName` enum: `1` = favorite, `4` = reply, `5` = quote, `6` = repost, `11` = dwell, `13` = video quality view.
+- **Adjust retrieval depth**: Use `--top_k_retrieval 500` to retrieve more candidates before ranking.
+- **Display more results**: Use `--top_k_display 50` to show more ranked results.
+
+### Model Architecture (Mini Config)
+
+| Parameter | Value |
+|---|---|
+| Embedding dimension | 128 |
+| Transformer layers | 4 |
+| Attention heads | 4 |
+| Key size | 32 |
+| Widening factor | 2 |
+| History sequence length | 127 |
+| Candidate sequence length | 64 |
+| User/Item/Author vocab | 1,000,000 each |
+| Hashes per entity | 2 |
+| Action types | 19 |
 
 ### Running Tests
 

@@ -1,14 +1,17 @@
+pub mod ads;
 mod candidate_hydrators;
-mod candidate_pipeline;
-pub mod clients; // Excluded from open source release for security reasons
+pub mod candidate_pipeline;
 mod filters;
-pub mod params; // Excluded from open source release for security reasons
+mod for_you_server;
+pub mod models;
 mod query_hydrators;
+mod scored_posts_server;
 pub mod scorers;
 mod selectors;
-mod server;
+pub mod server;
 mod side_effects;
 mod sources;
-pub mod util; // Excluded from open source release for security reasons
 
-pub use server::HomeMixerServer;
+pub use for_you_server::ForYouFeedServer;
+pub use scored_posts_server::ScoredPostsServer;
+pub use server::{HomeMixerConfig, HomeMixerServer};

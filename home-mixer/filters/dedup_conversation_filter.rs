@@ -1,19 +1,16 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
 use std::collections::HashMap;
-use tonic::async_trait;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
-/// Keeps only the highest-scored candidate per branch of a conversation tree
 pub struct DedupConversationFilter;
 
-#[async_trait]
 impl Filter<ScoredPostsQuery, PostCandidate> for DedupConversationFilter {
-    async fn filter(
+    fn filter(
         &self,
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
-    ) -> Result<FilterResult<PostCandidate>, String> {
+    ) -> FilterResult<PostCandidate> {
         let mut kept: Vec<PostCandidate> = Vec::new();
         let mut removed: Vec<PostCandidate> = Vec::new();
         let mut best_per_convo: HashMap<u64, (usize, f64)> = HashMap::new();
@@ -37,7 +34,7 @@ impl Filter<ScoredPostsQuery, PostCandidate> for DedupConversationFilter {
             }
         }
 
-        Ok(FilterResult { kept, removed })
+        FilterResult { kept, removed }
     }
 }
 
@@ -47,5 +44,5 @@ fn get_conversation_id(candidate: &PostCandidate) -> u64 {
         .iter()
         .copied()
         .min()
-        .unwrap_or(candidate.tweet_id as u64)
+        .unwrap_or(candidate.tweet_id)
 }

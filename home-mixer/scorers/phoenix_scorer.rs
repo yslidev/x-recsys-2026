@@ -1,176 +1,124 @@
-use crate::candidate_pipeline::candidate::{PhoenixScores, PostCandidate};
-use crate::candidate_pipeline::query::ScoredPostsQuery;
-use crate::clients::phoenix_prediction_client::PhoenixPredictionClient;
-use crate::util::request_util;
-use std::collections::HashMap;
+use crate::models::candidate::CandidateHelpers;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
+use crate::params::{
+    PhoenixInferenceClusterId, PhoenixRankerNewUserHistoryThreshold,
+    PhoenixRankerNewUserInferenceClusterId, UseEgressSidecar,
+};
+use crate::util::phoenix_request::build_prediction_request;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
+    PhoenixCluster, PhoenixPredictionClient,
+};
+
+use xai_candidate_pipeline::component_library::utils::current_timestamp_millis;
 use xai_candidate_pipeline::scorer::Scorer;
-use xai_recsys_proto::{ActionName, ContinuousActionName};
+use xai_recsys_proto::ProductSurface;
 
 pub struct PhoenixScorer {
     pub phoenix_client: Arc<dyn PhoenixPredictionClient + Send + Sync>,
+    pub egress_client: Arc<dyn PhoenixPredictionClient + Send + Sync>,
+}
+
+impl PhoenixScorer {
+    fn resolve_cluster(query: &ScoredPostsQuery) -> PhoenixCluster {
+        let configured_cluster =
+            PhoenixCluster::parse(&query.params.get(PhoenixInferenceClusterId));
+
+        let threshold: u64 = query.params.get(PhoenixRankerNewUserHistoryThreshold);
+        if threshold > 0 {
+            let action_count = query
+                .scoring_sequence
+                .as_ref()
+                .and_then(|s| s.metadata.as_ref())
+                .map(|m| m.length)
+                .unwrap_or(0);
+
+            if action_count < threshold {
+                return PhoenixCluster::parse(
+                    &query.params.get(PhoenixRankerNewUserInferenceClusterId),
+                );
+            }
+        }
+
+        if let Some(decider) = &query.decider {
+            match configured_cluster {
+                PhoenixCluster::Experiment1Fou if decider.enabled("override_qf_use_lap7") => {
+                    return PhoenixCluster::Experiment1Lap7;
+                }
+                PhoenixCluster::Experiment1Lap7 if decider.enabled("override_qf_use_fou") => {
+                    return PhoenixCluster::Experiment1Fou;
+                }
+                _ => {}
+            }
+        }
+
+        configured_cluster
+    }
 }
 
 #[async_trait]
 impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScorer {
-    #[xai_stats_macro::receive_stats]
+    fn enable(&self, query: &ScoredPostsQuery) -> bool {
+        !query.has_cached_posts
+    }
+
     async fn score(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Result<Vec<PostCandidate>, String> {
-        let user_id = query.user_id as u64;
-        let prediction_request_id = request_util::generate_request_id();
-        let last_scored_at_ms = Self::current_timestamp_millis();
+    ) -> Vec<Result<PostCandidate, String>> {
+        let last_scored_at_ms = current_timestamp_millis();
+        let product_surface = if query.in_network_only {
+            ProductSurface::HomeTimelineRankedFollowing
+        } else {
+            ProductSurface::HomeTimelineRanking
+        };
 
-        if let Some(sequence) = &query.user_action_sequence {
-            let tweet_infos: Vec<xai_recsys_proto::TweetInfo> = candidates
-                .iter()
-                .map(|c| {
-                    let tweet_id = c.retweeted_tweet_id.unwrap_or(c.tweet_id as u64);
-                    let author_id = c.retweeted_user_id.unwrap_or(c.author_id);
-                    xai_recsys_proto::TweetInfo {
-                        tweet_id,
-                        author_id,
-                        ..Default::default()
-                    }
-                })
-                .collect();
+        if query.scoring_sequence.is_none() {
+            return vec![Ok(PostCandidate::default()); candidates.len()];
+        };
 
-            let result = self
-                .phoenix_client
-                .predict(user_id, sequence.clone(), tweet_infos)
-                .await;
+        let cluster = Self::resolve_cluster(query);
+        let request = build_prediction_request(query, candidates, product_surface);
 
-            if let Ok(response) = result {
-                let predictions_map = self.build_predictions_map(&response);
+        let use_egress: bool = query.params.get(UseEgressSidecar);
+        let client = if use_egress {
+            &self.egress_client
+        } else {
+            &self.phoenix_client
+        };
 
-                let scored_candidates = candidates
-                    .iter()
-                    .map(|c| {
-                        // For retweets, look up predictions using the original tweet id
-                        let lookup_tweet_id = c.retweeted_tweet_id.unwrap_or(c.tweet_id as u64);
+        let mut predictions = client.predict(cluster, request.clone()).await;
 
-                        let phoenix_scores = predictions_map
-                            .get(&lookup_tweet_id)
-                            .map(|preds| self.extract_phoenix_scores(preds))
-                            .unwrap_or_default();
-
-                        PostCandidate {
-                            phoenix_scores,
-                            prediction_request_id: Some(prediction_request_id),
-                            last_scored_at_ms,
-                            ..Default::default()
-                        }
-                    })
-                    .collect();
-
-                return Ok(scored_candidates);
-            }
+        if predictions.is_err() && use_egress {
+            tracing::debug!("Egress predict failed, falling back");
+            predictions = self.phoenix_client.predict(cluster, request).await;
         }
 
-        // Return candidates unchanged if no scoring could be done
-        Ok(candidates.to_vec())
+        let predictions = predictions.map_err(|e| format!("Phoenix prediction failed: {}", e));
+
+        let predictions = match predictions {
+            Ok(predictions) => predictions,
+            Err(err) => return vec![Err(err); candidates.len()],
+        };
+
+        candidates
+            .iter()
+            .map(|c| PostCandidate {
+                phoenix_scores: predictions.candidate_scores(&c.get_original_tweet_id()),
+                prediction_request_id: Some(query.prediction_id),
+                last_scored_at_ms,
+                ..Default::default()
+            })
+            .map(Ok)
+            .collect()
     }
 
     fn update(&self, candidate: &mut PostCandidate, scored: PostCandidate) {
         candidate.phoenix_scores = scored.phoenix_scores;
         candidate.prediction_request_id = scored.prediction_request_id;
         candidate.last_scored_at_ms = scored.last_scored_at_ms;
-    }
-}
-
-impl PhoenixScorer {
-    /// Builds Map[tweet_id -> ActionPredictions]
-    fn build_predictions_map(
-        &self,
-        response: &xai_recsys_proto::PredictNextActionsResponse,
-    ) -> HashMap<u64, ActionPredictions> {
-        let mut predictions_map = HashMap::new();
-
-        let Some(distribution_set) = response.distribution_sets.first() else {
-            return predictions_map;
-        };
-
-        for distribution in &distribution_set.candidate_distributions {
-            let Some(candidate) = &distribution.candidate else {
-                continue;
-            };
-            let tweet_id = candidate.tweet_id;
-
-            let action_probs: HashMap<usize, f64> = distribution
-                .top_log_probs
-                .iter()
-                .enumerate()
-                .map(|(idx, log_prob)| (idx, (*log_prob as f64).exp()))
-                .collect();
-
-            let continuous_values: HashMap<usize, f64> = distribution
-                .continuous_actions_values
-                .iter()
-                .enumerate()
-                .map(|(idx, value)| (idx, *value as f64))
-                .collect();
-
-            predictions_map.insert(
-                tweet_id,
-                ActionPredictions {
-                    action_probs,
-                    continuous_values,
-                },
-            );
-        }
-
-        predictions_map
-    }
-
-    fn extract_phoenix_scores(&self, p: &ActionPredictions) -> PhoenixScores {
-        PhoenixScores {
-            favorite_score: p.get(ActionName::ServerTweetFav),
-            reply_score: p.get(ActionName::ServerTweetReply),
-            retweet_score: p.get(ActionName::ServerTweetRetweet),
-            photo_expand_score: p.get(ActionName::ClientTweetPhotoExpand),
-            click_score: p.get(ActionName::ClientTweetClick),
-            profile_click_score: p.get(ActionName::ClientTweetClickProfile),
-            vqv_score: p.get(ActionName::ClientTweetVideoQualityView),
-            share_score: p.get(ActionName::ClientTweetShare),
-            share_via_dm_score: p.get(ActionName::ClientTweetClickSendViaDirectMessage),
-            share_via_copy_link_score: p.get(ActionName::ClientTweetShareViaCopyLink),
-            dwell_score: p.get(ActionName::ClientTweetRecapDwelled),
-            quote_score: p.get(ActionName::ServerTweetQuote),
-            quoted_click_score: p.get(ActionName::ClientQuotedTweetClick),
-            follow_author_score: p.get(ActionName::ClientTweetFollowAuthor),
-            not_interested_score: p.get(ActionName::ClientTweetNotInterestedIn),
-            block_author_score: p.get(ActionName::ClientTweetBlockAuthor),
-            mute_author_score: p.get(ActionName::ClientTweetMuteAuthor),
-            report_score: p.get(ActionName::ClientTweetReport),
-            dwell_time: p.get_continuous(ContinuousActionName::DwellTime),
-        }
-    }
-
-    fn current_timestamp_millis() -> Option<u64> {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .map(|duration| duration.as_millis() as u64)
-    }
-}
-
-struct ActionPredictions {
-    /// Map of action index -> probability (exp of log prob)
-    action_probs: HashMap<usize, f64>,
-    /// Map of continuous action index -> value
-    continuous_values: HashMap<usize, f64>,
-}
-
-impl ActionPredictions {
-    fn get(&self, action: ActionName) -> Option<f64> {
-        self.action_probs.get(&(action as usize)).copied()
-    }
-
-    fn get_continuous(&self, action: ContinuousActionName) -> Option<f64> {
-        self.continuous_values.get(&(action as usize)).copied()
     }
 }

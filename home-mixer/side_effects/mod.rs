@@ -1,1 +1,14 @@
-pub mod cache_request_info_side_effect;
+pub mod ads_injection_logging_side_effect;
+pub mod client_events_kafka_side_effect;
+pub mod for_you_response_stats_side_effect;
+pub mod mutual_follow_stats_side_effect;
+pub mod phoenix_experiments_side_effect;
+pub mod phoenix_request_cache_side_effect;
+pub mod publish_seen_ids_to_kafka_side_effect;
+pub mod redis_post_candidate_cache_side_effect;
+pub mod reranking_kafka_side_effect;
+pub mod scored_stats_side_effect;
+pub mod served_candidates_kafka_side_effect;
+pub mod truncate_served_history_side_effect;
+pub mod update_past_request_timestamps_side_effect;
+pub mod update_served_history_side_effect;

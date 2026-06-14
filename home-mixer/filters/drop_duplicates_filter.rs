@@ -1,18 +1,16 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
 use std::collections::HashSet;
-use tonic::async_trait;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
 pub struct DropDuplicatesFilter;
 
-#[async_trait]
 impl Filter<ScoredPostsQuery, PostCandidate> for DropDuplicatesFilter {
-    async fn filter(
+    fn filter(
         &self,
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
-    ) -> Result<FilterResult<PostCandidate>, String> {
+    ) -> FilterResult<PostCandidate> {
         let mut seen_ids = HashSet::new();
         let mut kept = Vec::new();
         let mut removed = Vec::new();
@@ -25,6 +23,6 @@ impl Filter<ScoredPostsQuery, PostCandidate> for DropDuplicatesFilter {
             }
         }
 
-        Ok(FilterResult { kept, removed })
+        FilterResult { kept, removed }
     }
 }

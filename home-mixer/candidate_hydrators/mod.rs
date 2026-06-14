@@ -1,6 +1,16 @@
+pub mod ads_brand_safety_hydrator;
+pub mod ads_brand_safety_vf_hydrator;
+pub mod blocked_by_hydrator;
 pub mod core_data_candidate_hydrator;
+pub mod filtered_topics_hydrator;
+pub mod following_replied_users_hydrator;
 pub mod gizmoduck_hydrator;
+pub mod has_media_hydrator;
 pub mod in_network_candidate_hydrator;
+pub mod language_code_hydrator;
+pub mod mutual_follow_jaccard_hydrator;
+pub mod quote_hydrator;
 pub mod subscription_hydrator;
+pub mod tweet_type_metrics_hydrator;
 pub mod vf_candidate_hydrator;
 pub mod video_duration_candidate_hydrator;

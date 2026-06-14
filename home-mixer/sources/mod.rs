@@ -1,2 +1,11 @@
+pub mod ads_source;
+pub mod cached_posts_source;
+pub mod phoenix_moe_source;
 pub mod phoenix_source;
+pub mod phoenix_topics_source;
+pub mod prompts_source;
+pub mod push_to_home_source;
+pub mod scored_posts_source;
 pub mod thunder_source;
+pub mod tweet_mixer_source;
+pub mod who_to_follow_source;

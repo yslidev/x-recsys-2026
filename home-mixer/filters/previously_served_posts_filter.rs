@@ -1,28 +1,33 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
+use crate::params::EnableServedFilterAllRequests;
 use crate::util::candidates_util::get_related_post_ids;
-use tonic::async_trait;
+use xai_candidate_pipeline::component_library::utils::client_utils::RequestContext::{
+    self, ForegroundTruncate,
+};
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
 pub struct PreviouslyServedPostsFilter;
 
-#[async_trait]
 impl Filter<ScoredPostsQuery, PostCandidate> for PreviouslyServedPostsFilter {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
-        query.is_bottom_request
+        let req_context = RequestContext::parse(&query.request_context);
+        let enable_all = query.params.get(EnableServedFilterAllRequests);
+
+        enable_all || (query.is_bottom_request && req_context != ForegroundTruncate)
     }
 
-    async fn filter(
+    fn filter(
         &self,
         query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
-    ) -> Result<FilterResult<PostCandidate>, String> {
+    ) -> FilterResult<PostCandidate> {
         let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
             get_related_post_ids(c)
                 .iter()
                 .any(|id| query.served_ids.contains(id))
         });
 
-        Ok(FilterResult { kept, removed })
+        FilterResult { kept, removed }
     }
 }

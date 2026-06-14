@@ -38,6 +38,37 @@ from recsys_model import (
 rank_logger = logging.getLogger("rank")
 
 
+def load_model_params(checkpoint_path: str) -> hk.Params:
+    """Load model parameters from an exported checkpoint.
+
+    Args:
+        checkpoint_path: Path to model_params.npz file
+
+    Returns:
+        Haiku params dict (nested FrozenDict)
+    """
+    data = np.load(checkpoint_path, allow_pickle=True)
+    params: dict = {}
+    for key in data.files:
+        parts = key.split("/")
+        module_path = "/".join(parts[:-1])
+        param_name = parts[-1]
+        params.setdefault(module_path, {})[param_name] = jnp.array(data[key])
+    return hk.data_structures.to_haiku_dict(params)
+
+
+def load_embedding_table(path: str) -> np.ndarray:
+    """Load an embedding table from an exported checkpoint.
+
+    Args:
+        path: Path to embedding_tables.npz file
+
+    Returns:
+        Dict with 'user_embeddings', 'item_embeddings', 'author_embeddings' arrays
+    """
+    return dict(np.load(path))
+
+
 def create_dummy_batch_from_config(
     hash_config: Any,
     history_len: int,
@@ -221,6 +252,24 @@ ACTIONS: List[str] = [
     "dwell_time",
 ]
 
+CONTINUOUS_ACTIONS: List[str] = [
+    "reserved",
+    "dwell_time",
+    "video_watch_time",
+    "scroll_depth",
+    "reserved_3",
+    "reserved_4",
+    "reserved_5",
+    "reserved_6",
+]
+
+NEGATIVE_FEEDBACK_INDICES: List[int] = [
+    14,
+    15,
+    16,
+    17,
+]
+
 
 class RankingOutput(NamedTuple):
     """Output from ranking candidates.
@@ -252,6 +301,7 @@ class RankingOutput(NamedTuple):
     p_mute_author_score: jax.Array
     p_report_score: jax.Array
     p_dwell_time: jax.Array
+    continuous_preds: Optional[jax.Array] = None
 
 
 @dataclass
@@ -292,7 +342,11 @@ class ModelRunner(BaseModelRunner):
         self,
         init_data: RecsysBatch,
         init_embeddings: RecsysEmbeddings,
+        checkpoint_path: Optional[str] = None,
     ):
+        if checkpoint_path is not None:
+            params = load_model_params(checkpoint_path)
+            return TrainingState(params=params)
         rng = jax.random.PRNGKey(self.rng_seed)
         state = self.init(rng, init_data, init_embeddings)
         return state
@@ -368,6 +422,7 @@ class RecsysInferenceRunner(BaseInferenceRunner):
                 p_mute_author_score=probs[:, :, 16],
                 p_report_score=probs[:, :, 17],
                 p_dwell_time=probs[:, :, 18],
+                continuous_preds=output.continuous_preds,
             )
 
         rank_ = hk.without_apply_rng(hk.transform(hk_rank_candidates))
@@ -396,9 +451,12 @@ def create_example_batch(
     num_item_hashes: int = 2,
     num_author_hashes: int = 2,
     product_surface_vocab_size: int = 16,
-    num_user_embeddings: int = 100000,
-    num_post_embeddings: int = 100000,
-    num_author_embeddings: int = 100000,
+    num_user_embeddings: int = 1_000_000,
+    num_post_embeddings: int = 1_000_000,
+    num_author_embeddings: int = 1_000_000,
+    include_continuous_actions: bool = False,
+    include_timestamps: bool = False,
+    num_continuous_actions: int = 8,
 ) -> Tuple[RecsysBatch, RecsysEmbeddings]:
     """Create an example batch with random data for testing.
 
@@ -457,6 +515,23 @@ def create_example_batch(
         0, product_surface_vocab_size, size=(batch_size, num_candidates)
     ).astype(np.int32)
 
+    history_continuous_actions = None
+    if include_continuous_actions:
+        history_continuous_actions = np.zeros(
+            (batch_size, history_len, num_continuous_actions), dtype=np.float32
+        )
+        history_continuous_actions[:, :, 1] = rng.exponential(
+            scale=10.0, size=(batch_size, history_len)
+        ).astype(np.float32)
+
+    candidate_impr_ts = None
+    candidate_post_creation_ts = None
+    if include_timestamps:
+        base_ts = 1700000000
+        candidate_impr_ts = np.full((batch_size, num_candidates), base_ts, dtype=np.int32)
+        age_seconds = rng.integers(60, 72 * 3600, size=(batch_size, num_candidates))
+        candidate_post_creation_ts = (candidate_impr_ts - age_seconds).astype(np.int32)
+
     batch = RecsysBatch(
         user_hashes=user_hashes,
         history_post_hashes=history_post_hashes,
@@ -466,6 +541,9 @@ def create_example_batch(
         candidate_post_hashes=candidate_post_hashes,
         candidate_author_hashes=candidate_author_hashes,
         candidate_product_surface=candidate_product_surface,
+        history_continuous_actions=history_continuous_actions,
+        candidate_impr_ts=candidate_impr_ts,
+        candidate_post_creation_ts=candidate_post_creation_ts,
     )
 
     embeddings = RecsysEmbeddings(

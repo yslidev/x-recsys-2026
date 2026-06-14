@@ -85,6 +85,30 @@ class TransformerOutput(NamedTuple):
     embeddings: jax.Array
 
 
+def right_anchored_rope_positions(
+    padding_mask: jax.Array,
+    history_seq_len: int,
+    num_user_prefix_tokens: int,
+) -> jax.Array:
+    """Compute RoPE positions where the newest history token always gets a fixed position."""
+    history_start = num_user_prefix_tokens
+    history_end = num_user_prefix_tokens + history_seq_len
+
+    idx = jnp.arange(padding_mask.shape[1], dtype=jnp.int32)[None, :]
+    history_len = padding_mask[:, history_start:history_end].sum(axis=1, dtype=jnp.int32)
+
+    positions = jnp.where(
+        (history_start <= idx) & (idx < history_end),
+        history_end - history_len[:, None] + idx - history_start,
+        idx,
+    )
+
+    positions = jnp.where(idx >= history_end, history_end, positions)
+    positions = jnp.where(padding_mask, positions, 0).astype(jnp.float32)
+
+    return positions
+
+
 @dataclass
 class TransformerConfig:
     emb_size: int
@@ -289,6 +313,7 @@ class MultiHeadAttention(hk.Module):
         key: jax.Array,
         value: jax.Array,
         mask: jax.Array,
+        positions: Optional[jax.Array] = None,
     ) -> MHAOutput:
         # In shape hints below, we suppress the leading dims [...] for brevity.
         # Hence e.g. [A, B] should be read in every case as [..., A, B].
@@ -324,8 +349,8 @@ class MultiHeadAttention(hk.Module):
         value_heads = projection(value, self.value_size, self.num_kv_heads, name="value")
 
         rotate = RotaryEmbedding(dim=self.key_size, base_exponent=int(1e4))
-        key_heads = rotate(key_heads, seq_dim=1, offset=0)
-        query_heads = rotate(query_heads, seq_dim=1, offset=0)
+        key_heads = rotate(key_heads, seq_dim=1, offset=0, t=positions)
+        query_heads = rotate(query_heads, seq_dim=1, offset=0, t=positions)
 
         b, t, h, d = query_heads.shape
         _, _, kv_h, _ = key_heads.shape
@@ -389,6 +414,7 @@ class MHABlock(hk.Module):
         self,
         inputs: jax.Array,  # [B, T, D]
         mask: jax.Array,  # [B, 1, T, T] or [B, 1, 1, T] or B[1, 1, 1, 1]
+        positions: Optional[jax.Array] = None,
     ) -> MHAOutput:
         _, _, model_size = inputs.shape
         assert mask.ndim == 4, f"shape: {mask.shape}"
@@ -403,7 +429,7 @@ class MHABlock(hk.Module):
                 key_size=self.key_size,
                 model_size=model_size,
                 attn_output_multiplier=self.attn_output_multiplier,
-            )(query, key, value, mask)
+            )(query, key, value, mask, positions=positions)
 
         attn_output = attn_block(inputs, side_input, side_input, mask)
         h_attn = attn_output.embeddings
@@ -458,6 +484,7 @@ class DecoderLayer(hk.Module):
         inputs: jax.Array,  # [B, T, D]
         mask: jax.Array,  # [B, 1, T, T] or [B, 1, 1, T]
         padding_mask: Optional[jax.Array],
+        positions: Optional[jax.Array] = None,
     ) -> DecoderOutput:
         """Transforms input embedding sequences to output embedding sequences."""
         del padding_mask  # Unused.
@@ -472,7 +499,7 @@ class DecoderLayer(hk.Module):
             num_kv_heads=self.num_kv_heads,
             key_size=self.key_size,
             attn_output_multiplier=self.attn_output_multiplier,
-        )(layer_norm(h), mask)
+        )(layer_norm(h), mask, positions=positions)
         h_attn = attn_output.embeddings
 
         h_attn = layer_norm(h_attn)
@@ -518,6 +545,7 @@ class Transformer(hk.Module):
         embeddings: jax.Array,  # [B, T, D]
         mask: jax.Array,  # [B, T]
         candidate_start_offset: Optional[int] = None,
+        positions: Optional[jax.Array] = None,
     ) -> TransformerOutput:
         """Transforms input embedding sequences to output embedding sequences.
 
@@ -528,6 +556,8 @@ class Transformer(hk.Module):
                 candidates that can only attend to positions before the offset (user+history)
                 and themselves (self-attention), but not to other candidates.
                 Used for recommendation system inference.
+            positions: Optional custom RoPE positions of shape [B, T]. When None,
+                standard sequential positions are used.
 
         Returns:
             TransformerOutput containing the output embeddings.
@@ -569,7 +599,7 @@ class Transformer(hk.Module):
                 attn_output_multiplier=self.attn_output_multiplier,
                 name=name,
                 layer_index=layer_index,
-            )(h, mask, padding_mask)
+            )(h, mask, padding_mask, positions=positions)
 
         for i in range(self.num_layers):
             decoder_output = block(

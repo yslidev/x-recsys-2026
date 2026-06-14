@@ -1,8 +1,7 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
-use crate::util::snowflake;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
 use std::time::Duration;
-use tonic::async_trait;
+use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
 /// Filter that removes tweets older than a specified duration.
@@ -15,24 +14,23 @@ impl AgeFilter {
         Self { max_age }
     }
 
-    fn is_within_age(&self, tweet_id: i64) -> bool {
-        snowflake::duration_since_creation_opt(tweet_id)
+    fn is_within_age(&self, tweet_id: u64) -> bool {
+        duration_since_creation_opt(tweet_id)
             .map(|age| age <= self.max_age)
             .unwrap_or(false)
     }
 }
 
-#[async_trait]
 impl Filter<ScoredPostsQuery, PostCandidate> for AgeFilter {
-    async fn filter(
+    fn filter(
         &self,
         _query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
-    ) -> Result<FilterResult<PostCandidate>, String> {
+    ) -> FilterResult<PostCandidate> {
         let (kept, removed): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .partition(|c| self.is_within_age(c.tweet_id));
 
-        Ok(FilterResult { kept, removed })
+        FilterResult { kept, removed }
     }
 }

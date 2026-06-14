@@ -1,0 +1,146 @@
+use crate::clients::kafka_publisher_client::{
+    ADS_INJECTION_TOPIC, KafkaCluster, KafkaPublisherClient, ProdKafkaPublisherClient,
+};
+use crate::models::query::ScoredPostsQuery;
+use crate::params::EnableAdsInjectionLogging;
+use prost::Message;
+use std::sync::Arc;
+use tonic::async_trait;
+use xai_ads_injection_proto::ads_injected_timeline::{
+    AdsInjectedTimeline, Counts, DisplayLocation, SubscriptionLevel, TimelineEntry,
+};
+use xai_candidate_pipeline::component_library::utils::is_prod;
+use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
+use xai_core_entities::entities::SubscriptionLevel as CoreSubscriptionLevel;
+use xai_home_mixer_proto::{FeedItem, feed_item};
+
+#[derive(Clone)]
+pub struct AdsInjectionLoggingSideEffect {
+    kafka_client: Arc<dyn KafkaPublisherClient>,
+}
+
+impl AdsInjectionLoggingSideEffect {
+    pub fn new(kafka_client: Arc<dyn KafkaPublisherClient>) -> Self {
+        Self { kafka_client }
+    }
+
+    pub async fn prod() -> Self {
+        Self::new(Arc::new(
+            ProdKafkaPublisherClient::new(ADS_INJECTION_TOPIC, KafkaCluster::Ads).await,
+        ))
+    }
+}
+
+#[async_trait]
+impl SideEffect<ScoredPostsQuery, FeedItem> for AdsInjectionLoggingSideEffect {
+    fn enable(&self, query: Arc<ScoredPostsQuery>) -> bool {
+        is_prod() && query.params.get(EnableAdsInjectionLogging)
+    }
+
+    async fn side_effect(
+        &self,
+        input: Arc<SideEffectInput<ScoredPostsQuery, FeedItem>>,
+    ) -> Result<(), String> {
+        let query = &input.query;
+        let items = &input.selected_candidates;
+
+        let fetched_posts = count_posts(items) + count_posts(&input.non_selected_candidates);
+        let fetched_ads = count_ads(items) + count_ads(&input.non_selected_candidates);
+
+        let request_time_ms = query.request_time_ms;
+
+        let entries: Vec<TimelineEntry> = items
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| build_timeline_entry(item, pos))
+            .collect();
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let timeline = AdsInjectedTimeline {
+            user_id: query.user_id,
+            entries,
+            request_time_ms,
+            display_location: DisplayLocation::TimelineHome.into(),
+            country_code: query.country_code.clone(),
+            request_id: query.request_id,
+            subscription_level: query
+                .subscription_level
+                .map(sub_level_to_proto)
+                .unwrap_or(SubscriptionLevel::LevelUnspecified)
+                .into(),
+            client_app_id: query.client_app_id as i64,
+            counts: Some(Counts {
+                retrieved_posts: fetched_posts as i32,
+                retrieved_ads: fetched_ads as i32,
+                response_posts: count_posts(items) as i32,
+                response_ads: count_ads(items) as i32,
+            }),
+            ip_address: query.ip_address.clone(),
+            user_agent: query.user_agent.clone(),
+        };
+
+        let bytes = timeline.encode_to_vec();
+        self.kafka_client
+            .send(&bytes)
+            .await
+            .map_err(|e| format!("Ads Kafka publish failed: {e}"))?;
+        Ok(())
+    }
+}
+
+fn build_timeline_entry(item: &FeedItem, position: usize) -> TimelineEntry {
+    match &item.item {
+        Some(feed_item::Item::Post(post)) => TimelineEntry {
+            tweet_id: post.tweet_id,
+            author_id: post.author_id,
+            position: position as i32,
+            promoted: false,
+            impression_id: 0,
+            brand_safety_verdict: post.brand_safety_verdict,
+            ad_info: None,
+            safety_labels: post.safety_label_types.clone(),
+        },
+        Some(feed_item::Item::Ad(ad)) => TimelineEntry {
+            tweet_id: ad.post_id as u64,
+            author_id: ad.author_id as u64,
+            position: position as i32,
+            promoted: true,
+            impression_id: ad.impression_id as u64,
+            brand_safety_verdict: 0,
+            ad_info: Some(ad.clone()),
+            safety_labels: vec![],
+        },
+        Some(feed_item::Item::WhoToFollow(_))
+        | Some(feed_item::Item::Prompt(_))
+        | Some(feed_item::Item::PushToHome(_))
+        | None => TimelineEntry {
+            position: position as i32,
+            ..Default::default()
+        },
+    }
+}
+
+fn sub_level_to_proto(level: CoreSubscriptionLevel) -> SubscriptionLevel {
+    match level {
+        CoreSubscriptionLevel::Basic => SubscriptionLevel::Basic,
+        CoreSubscriptionLevel::Premium => SubscriptionLevel::Premium,
+        CoreSubscriptionLevel::PremiumPlus => SubscriptionLevel::PremiumPlus,
+    }
+}
+
+fn count_posts(items: &[FeedItem]) -> usize {
+    items
+        .iter()
+        .filter(|i| matches!(i.item, Some(feed_item::Item::Post(_))))
+        .count()
+}
+
+fn count_ads(items: &[FeedItem]) -> usize {
+    items
+        .iter()
+        .filter(|i| matches!(i.item, Some(feed_item::Item::Ad(_))))
+        .count()
+}

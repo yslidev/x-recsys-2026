@@ -1,5 +1,6 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
+use anyhow::Result;
 use futures::future::join;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,7 +8,7 @@ use tonic::async_trait;
 use xai_candidate_pipeline::hydrator::Hydrator;
 use xai_twittercontext_proto::GetTwitterContextViewer;
 use xai_twittercontext_proto::TwitterContextViewer;
-use xai_visibility_filtering::models::FilteredReason;
+use xai_visibility_filtering::models::{Action, FilteredReason};
 use xai_visibility_filtering::vf_client::SafetyLevel;
 use xai_visibility_filtering::vf_client::SafetyLevel::{TimelineHome, TimelineHomeRecommendations};
 use xai_visibility_filtering::vf_client::VisibilityFilteringClient;
@@ -23,43 +24,54 @@ impl VFCandidateHydrator {
 
     async fn fetch_vf_results(
         client: &Arc<dyn VisibilityFilteringClient + Send + Sync>,
-        tweet_ids: Vec<i64>,
+        tweet_ids: Vec<u64>,
         safety_level: SafetyLevel,
-        for_user_id: i64,
+        for_user_id: u64,
         context: Option<TwitterContextViewer>,
-    ) -> Result<HashMap<i64, Option<FilteredReason>>, String> {
+    ) -> HashMap<u64, Result<Option<FilteredReason>>> {
         if tweet_ids.is_empty() {
-            return Ok(HashMap::new());
+            return HashMap::new();
         }
 
         client
             .get_result(tweet_ids, safety_level, for_user_id, context)
             .await
-            .map_err(|e| e.to_string())
     }
 }
 
 #[async_trait]
 impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {
-    #[xai_stats_macro::receive_stats]
     async fn hydrate(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Result<Vec<PostCandidate>, String> {
+    ) -> Vec<Result<PostCandidate, String>> {
         let context = query.get_viewer();
         let user_id = query.user_id;
         let client = &self.vf_client;
 
-        let mut in_network_ids = Vec::new();
-        let mut oon_ids = Vec::new();
+        let mut in_network_ids: Vec<u64> = Vec::new();
+        let mut oon_ids: Vec<u64> = Vec::new();
+
         for candidate in candidates.iter() {
             if candidate.in_network.unwrap_or(false) {
                 in_network_ids.push(candidate.tweet_id);
             } else {
                 oon_ids.push(candidate.tweet_id);
             }
+            for &ancestor_id in &candidate.ancestors {
+                oon_ids.push(ancestor_id);
+            }
+            if let Some(quoted_id) = candidate.quoted_tweet_id {
+                oon_ids.push(quoted_id);
+            }
+            if let Some(retweeted_id) = candidate.retweeted_tweet_id {
+                in_network_ids.push(retweeted_id);
+            }
         }
+
+        oon_ids.sort_unstable();
+        oon_ids.dedup();
 
         let in_network_future = Self::fetch_vf_results(
             client,
@@ -78,24 +90,73 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for VFCandidateHydrator {
         );
 
         let (in_network_result, oon_result) = join(in_network_future, oon_future).await;
-        let mut result: HashMap<i64, Option<FilteredReason>> = HashMap::new();
-        result.extend(in_network_result?);
-        result.extend(oon_result?);
+        let mut all_results: HashMap<u64, Result<Option<FilteredReason>>> = HashMap::new();
+        all_results.extend(in_network_result);
+        all_results.extend(oon_result);
 
         let mut hydrated_candidates = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let visibility_reason = result.get(&candidate.tweet_id);
-            let visibility_reason = visibility_reason.unwrap_or(&None);
-            let hydrated = PostCandidate {
-                visibility_reason: visibility_reason.clone(),
-                ..Default::default()
+            let primary_result = all_results.get(&candidate.tweet_id);
+            let visibility_reason = match primary_result {
+                Some(Ok(Some(reason))) => Some(reason.clone()),
+                _ => None,
+            };
+
+            let drop_ancillary = should_drop_ancillary(candidate, &all_results);
+
+            let hydrated = match primary_result {
+                Some(Err(err)) => Err(err.to_string()),
+                _ => Ok(PostCandidate {
+                    visibility_reason,
+                    drop_ancillary_posts: Some(drop_ancillary),
+                    ..Default::default()
+                }),
             };
             hydrated_candidates.push(hydrated);
         }
-        Ok(hydrated_candidates)
+        hydrated_candidates
     }
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {
         candidate.visibility_reason = hydrated.visibility_reason;
+        candidate.drop_ancillary_posts = hydrated.drop_ancillary_posts;
+    }
+}
+
+fn should_drop_ancillary(
+    candidate: &PostCandidate,
+    vf_results: &HashMap<u64, Result<Option<FilteredReason>>>,
+) -> bool {
+    for &ancestor_id in &candidate.ancestors {
+        if let Some(Ok(Some(reason))) = vf_results.get(&ancestor_id)
+            && should_drop_reason(reason)
+        {
+            return true;
+        }
+    }
+
+    if let Some(quoted_id) = candidate.quoted_tweet_id
+        && let Some(Ok(Some(reason))) = vf_results.get(&quoted_id)
+        && should_drop_reason(reason)
+    {
+        return true;
+    }
+
+    if let Some(retweeted_id) = candidate.retweeted_tweet_id
+        && let Some(Ok(Some(reason))) = vf_results.get(&retweeted_id)
+        && should_drop_reason(reason)
+    {
+        return true;
+    }
+
+    false
+}
+
+fn should_drop_reason(reason: &FilteredReason) -> bool {
+    match reason {
+        FilteredReason::SafetyResult(safety_result) => {
+            matches!(safety_result.action, Action::Drop(_))
+        }
+        _ => true,
     }
 }

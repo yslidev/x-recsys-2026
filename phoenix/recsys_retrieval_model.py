@@ -49,9 +49,15 @@ class CandidateTower(hk.Module):
 
     This tower takes the concatenated embeddings of a post and its author,
     and projects them to a normalized representation suitable for similarity search.
+
+    Supports two modes:
+    - enable_linear_proj=True: Two-layer MLP (SiLU) projection followed by L2 normalization.
+    - enable_linear_proj=False: Simple mean pooling across hash embeddings followed by
+      L2 normalization. More parameter-efficient but less expressive.
     """
 
     emb_size: int
+    enable_linear_proj: bool = True
     name: Optional[str] = None
 
     def __call__(self, post_author_embedding: jax.Array) -> jax.Array:
@@ -65,6 +71,13 @@ class CandidateTower(hk.Module):
             Normalized candidate representation
                 Shape: [B, C, D] or [B, D]
         """
+        if not self.enable_linear_proj:
+            candidate_representation = jnp.mean(post_author_embedding, axis=-2)
+            candidate_norm_sq = jnp.sum(candidate_representation**2, axis=-1, keepdims=True)
+            candidate_norm = jnp.sqrt(jnp.maximum(candidate_norm_sq, EPS))
+            candidate_representation = candidate_representation / candidate_norm
+            return candidate_representation.astype(post_author_embedding.dtype)
+
         if len(post_author_embedding.shape) == 4:
             B, C, _, _ = post_author_embedding.shape
             post_author_embedding = jnp.reshape(post_author_embedding, (B, C, -1))
@@ -118,6 +131,8 @@ class PhoenixRetrievalModelConfig:
     hash_config: HashConfig = None  # type: ignore
 
     product_surface_vocab_size: int = 16
+
+    enable_linear_proj: bool = True
 
     _initialized: bool = False
 
@@ -283,7 +298,7 @@ class PhoenixRetrievalModel(hk.Module):
         """Build candidate (item) representations.
 
         Projects post + author embeddings to a shared embedding space
-        using the candidate tower MLP.
+        using the candidate tower.
 
         Args:
             batch: RecsysBatch containing candidate hashes
@@ -304,6 +319,7 @@ class PhoenixRetrievalModel(hk.Module):
 
         candidate_tower = CandidateTower(
             emb_size=config.emb_size,
+            enable_linear_proj=config.enable_linear_proj,
         )
         candidate_representation = candidate_tower(post_author_embedding)
 

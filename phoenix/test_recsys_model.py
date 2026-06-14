@@ -16,7 +16,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from grok import make_recsys_attn_mask
+from grok import make_recsys_attn_mask, right_anchored_rope_positions
+from recsys_model import compute_post_age_bucket, normalize_continuous_value, NormConfig
 
 
 class TestMakeRecsysAttnMask:
@@ -44,9 +45,9 @@ class TestMakeRecsysAttnMask:
                 if j <= i:
                     assert mask_2d[i, j] == 1, f"Position {i} should attend to position {j}"
                 else:
-                    assert mask_2d[i, j] == 0, (
-                        f"Position {i} should NOT attend to future position {j}"
-                    )
+                    assert (
+                        mask_2d[i, j] == 0
+                    ), f"Position {i} should NOT attend to future position {j}"
 
     def test_candidates_attend_to_user_history(self):
         """Test that candidates can attend to all user+history positions."""
@@ -58,9 +59,9 @@ class TestMakeRecsysAttnMask:
 
         for candidate_pos in range(candidate_start_offset, seq_len):
             for history_pos in range(candidate_start_offset):
-                assert mask_2d[candidate_pos, history_pos] == 1, (
-                    f"Candidate at {candidate_pos} should attend to user+history at {history_pos}"
-                )
+                assert (
+                    mask_2d[candidate_pos, history_pos] == 1
+                ), f"Candidate at {candidate_pos} should attend to user+history at {history_pos}"
 
     def test_candidates_attend_to_themselves(self):
         """Test that candidates can attend to themselves (self-attention)."""
@@ -71,9 +72,9 @@ class TestMakeRecsysAttnMask:
         mask_2d = mask[0, 0]
 
         for candidate_pos in range(candidate_start_offset, seq_len):
-            assert mask_2d[candidate_pos, candidate_pos] == 1, (
-                f"Candidate at {candidate_pos} should attend to itself"
-            )
+            assert (
+                mask_2d[candidate_pos, candidate_pos] == 1
+            ), f"Candidate at {candidate_pos} should attend to itself"
 
     def test_candidates_do_not_attend_to_other_candidates(self):
         """Test that candidates cannot attend to other candidates."""
@@ -86,9 +87,9 @@ class TestMakeRecsysAttnMask:
         for query_pos in range(candidate_start_offset, seq_len):
             for key_pos in range(candidate_start_offset, seq_len):
                 if query_pos != key_pos:
-                    assert mask_2d[query_pos, key_pos] == 0, (
-                        f"Candidate at {query_pos} should NOT attend to candidate at {key_pos}"
-                    )
+                    assert (
+                        mask_2d[query_pos, key_pos] == 0
+                    ), f"Candidate at {query_pos} should NOT attend to candidate at {key_pos}"
 
     def test_full_mask_structure(self):
         """Test the complete mask structure with a small example."""
@@ -100,18 +101,6 @@ class TestMakeRecsysAttnMask:
 
         mask = make_recsys_attn_mask(seq_len, candidate_start_offset)
         mask_2d = mask[0, 0]
-
-        # Expected mask structure:
-        # Query positions are rows, key positions are columns
-        # 1 = can attend, 0 = cannot attend
-        #
-        #        Keys:  u   h1  h2  c1  c2  c3
-        # Query u   :   1   0   0   0   0   0
-        # Query h1  :   1   1   0   0   0   0
-        # Query h2  :   1   1   1   0   0   0
-        # Query c1  :   1   1   1   1   0   0   <- c1 attends to user+history + self
-        # Query c2  :   1   1   1   0   1   0   <- c2 attends to user+history + self
-        # Query c3  :   1   1   1   0   0   1   <- c3 attends to user+history + self
 
         expected = np.array(
             [
@@ -181,6 +170,139 @@ class TestMakeRecsysAttnMask:
         )
 
         np.testing.assert_array_equal(np.array(mask_2d), expected)
+
+
+class TestRightAnchoredRopePositions:
+    """Tests for the right_anchored_rope_positions function."""
+
+    def test_output_shape(self):
+        """Test that the output has the correct shape [B, T]."""
+        B, T = 2, 10
+        padding_mask = jnp.ones((B, T), dtype=jnp.bool_)
+        positions = right_anchored_rope_positions(
+            padding_mask, history_seq_len=6, num_user_prefix_tokens=1
+        )
+        assert positions.shape == (B, T)
+
+    def test_prefix_positions_preserved(self):
+        """Test that prefix token positions are 0..num_prefix-1."""
+        B, T = 1, 10
+        padding_mask = jnp.ones((B, T), dtype=jnp.bool_)
+        positions = right_anchored_rope_positions(
+            padding_mask, history_seq_len=6, num_user_prefix_tokens=2
+        )
+        assert float(positions[0, 0]) == 0.0
+        assert float(positions[0, 1]) == 1.0
+
+    def test_candidates_share_position(self):
+        """Test that all candidate positions are the same (history_end)."""
+        B = 1
+        num_prefix = 1
+        history_len = 4
+        num_candidates = 3
+        T = num_prefix + history_len + num_candidates
+
+        padding_mask = jnp.ones((B, T), dtype=jnp.bool_)
+        positions = right_anchored_rope_positions(
+            padding_mask, history_seq_len=history_len, num_user_prefix_tokens=num_prefix
+        )
+
+        history_end = num_prefix + history_len
+        for c in range(num_candidates):
+            assert float(positions[0, history_end + c]) == float(history_end)
+
+    def test_padding_gets_zero(self):
+        """Test that padded positions get position 0."""
+        B, T = 1, 8
+        padding_mask = jnp.array([[True, True, True, True, False, False, False, False]])
+        positions = right_anchored_rope_positions(
+            padding_mask, history_seq_len=4, num_user_prefix_tokens=1
+        )
+        for i in range(4, 8):
+            assert float(positions[0, i]) == 0.0
+
+
+class TestComputePostAgeBucket:
+    """Tests for the compute_post_age_bucket function."""
+
+    def test_basic_bucketing(self):
+        """Test basic bucketing with 60-minute granularity."""
+        # Post that is 30 minutes old -> bucket 1 (0-59 minutes)
+        impr_ts = jnp.array([[1000000]])
+        post_ts = jnp.array([[1000000 - 30 * 60]])
+        bucket = compute_post_age_bucket(impr_ts, post_ts, granularity_mins=60)
+        assert int(bucket[0, 0]) == 1
+
+    def test_two_hour_post(self):
+        """Test a 2-hour-old post -> bucket 3 (120-179 minutes)."""
+        impr_ts = jnp.array([[1000000]])
+        post_ts = jnp.array([[1000000 - 120 * 60]])
+        bucket = compute_post_age_bucket(impr_ts, post_ts, granularity_mins=60)
+        assert int(bucket[0, 0]) == 3
+
+    def test_missing_timestamp_zero(self):
+        """Test that missing timestamps (0) map to bucket 0."""
+        impr_ts = jnp.array([[0]])
+        post_ts = jnp.array([[1000000]])
+        bucket = compute_post_age_bucket(impr_ts, post_ts, granularity_mins=60)
+        assert int(bucket[0, 0]) == 0
+
+        impr_ts = jnp.array([[1000000]])
+        post_ts = jnp.array([[0]])
+        bucket = compute_post_age_bucket(impr_ts, post_ts, granularity_mins=60)
+        assert int(bucket[0, 0]) == 0
+
+    def test_negative_age_maps_to_zero(self):
+        """Test that negative age (clock skew) maps to bucket 0."""
+        impr_ts = jnp.array([[1000000]])
+        post_ts = jnp.array([[1000000 + 60 * 60]])  # post created AFTER impression
+        bucket = compute_post_age_bucket(impr_ts, post_ts, granularity_mins=60)
+        assert int(bucket[0, 0]) == 0
+
+    def test_overflow_bucket(self):
+        """Test that very old posts go to the overflow bucket."""
+        # POST_AGE_MAX_MINUTES = 4800 (80 hours)
+        impr_ts = jnp.array([[1000000]])
+        post_ts = jnp.array([[1000000 - 5000 * 60]])  # 5000 minutes old
+        bucket = compute_post_age_bucket(impr_ts, post_ts, granularity_mins=60)
+        # overflow bucket = 4800 // 60 + 1 = 81
+        assert int(bucket[0, 0]) == 81
+
+    def test_batch_processing(self):
+        """Test that bucketing works on batches."""
+        impr_ts = jnp.array([[1000000, 1000000, 1000000]])
+        post_ts = jnp.array([[1000000 - 30 * 60, 1000000 - 120 * 60, 0]])
+        buckets = compute_post_age_bucket(impr_ts, post_ts, granularity_mins=60)
+        assert buckets.shape == (1, 3)
+        assert int(buckets[0, 0]) == 1  # 30 min -> bucket 1
+        assert int(buckets[0, 1]) == 3  # 120 min -> bucket 3
+        assert int(buckets[0, 2]) == 0  # missing -> bucket 0
+
+
+class TestNormalizeContinuousValue:
+    """Tests for continuous value normalization."""
+
+    def test_linear_normalization(self):
+        """Test linear normalization: x / norm_scale."""
+        config = NormConfig(norm_scale=30.0, use_log=False)
+        values = jnp.array([0.0, 15.0, 30.0, 60.0])
+        result = normalize_continuous_value(values, config)
+        np.testing.assert_allclose(np.array(result), [0.0, 0.5, 1.0, 1.0], atol=1e-6)
+
+    def test_log_normalization(self):
+        """Test log normalization: log1p(x) / log1p(norm_scale)."""
+        config = NormConfig(norm_scale=30.0, use_log=True)
+        values = jnp.array([0.0, 30.0])
+        result = normalize_continuous_value(values, config)
+        assert float(result[0]) == pytest.approx(0.0, abs=1e-6)
+        assert float(result[1]) == pytest.approx(1.0, abs=1e-6)
+
+    def test_clamping(self):
+        """Test that values are clamped to [0, norm_scale]."""
+        config = NormConfig(norm_scale=10.0, use_log=False)
+        values = jnp.array([-5.0, 0.0, 5.0, 15.0])
+        result = normalize_continuous_value(values, config)
+        np.testing.assert_allclose(np.array(result), [0.0, 0.0, 0.5, 1.0], atol=1e-6)
 
 
 if __name__ == "__main__":

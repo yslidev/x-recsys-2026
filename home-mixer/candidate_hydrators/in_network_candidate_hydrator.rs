@@ -1,5 +1,5 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
 use std::collections::HashSet;
 use tonic::async_trait;
 use xai_candidate_pipeline::hydrator::Hydrator;
@@ -8,13 +8,16 @@ pub struct InNetworkCandidateHydrator;
 
 #[async_trait]
 impl Hydrator<ScoredPostsQuery, PostCandidate> for InNetworkCandidateHydrator {
-    #[xai_stats_macro::receive_stats]
+    fn enable(&self, query: &ScoredPostsQuery) -> bool {
+        !query.has_cached_posts
+    }
+
     async fn hydrate(
         &self,
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
-    ) -> Result<Vec<PostCandidate>, String> {
-        let viewer_id = query.user_id as u64;
+    ) -> Vec<Result<PostCandidate, String>> {
+        let viewer_id = query.user_id;
         let followed_ids: HashSet<u64> = query
             .user_features
             .followed_user_ids
@@ -23,19 +26,17 @@ impl Hydrator<ScoredPostsQuery, PostCandidate> for InNetworkCandidateHydrator {
             .map(|id| id as u64)
             .collect();
 
-        let hydrated_candidates = candidates
+        candidates
             .iter()
             .map(|candidate| {
                 let is_self = candidate.author_id == viewer_id;
                 let is_in_network = is_self || followed_ids.contains(&candidate.author_id);
-                PostCandidate {
+                Ok(PostCandidate {
                     in_network: Some(is_in_network),
                     ..Default::default()
-                }
+                })
             })
-            .collect();
-
-        Ok(hydrated_candidates)
+            .collect()
     }
 
     fn update(&self, candidate: &mut PostCandidate, hydrated: PostCandidate) {

@@ -1,5 +1,5 @@
-use crate::candidate_pipeline::candidate::PostCandidate;
-use crate::candidate_pipeline::query::ScoredPostsQuery;
+use crate::models::candidate::PostCandidate;
+use crate::models::query::ScoredPostsQuery;
 use crate::params;
 use xai_candidate_pipeline::selector::Selector;
 

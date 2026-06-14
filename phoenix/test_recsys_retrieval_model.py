@@ -46,7 +46,7 @@ class TestCandidateTower(unittest.TestCase):
         num_hashes = 4
 
         def forward(x):
-            tower = CandidateTower(emb_size=emb_size)
+            tower = CandidateTower(emb_size=emb_size, enable_linear_proj=True)
             return tower(x)
 
         forward_fn = hk.without_apply_rng(hk.transform(forward))
@@ -67,7 +67,7 @@ class TestCandidateTower(unittest.TestCase):
         num_hashes = 4
 
         def forward(x):
-            tower = CandidateTower(emb_size=emb_size)
+            tower = CandidateTower(emb_size=emb_size, enable_linear_proj=True)
             return tower(x)
 
         forward_fn = hk.without_apply_rng(hk.transform(forward))
@@ -89,7 +89,7 @@ class TestCandidateTower(unittest.TestCase):
         num_hashes = 4
 
         def forward(x):
-            tower = CandidateTower(emb_size=emb_size)
+            tower = CandidateTower(emb_size=emb_size, enable_linear_proj=False)
             return tower(x)
 
         forward_fn = hk.without_apply_rng(hk.transform(forward))
@@ -104,6 +104,27 @@ class TestCandidateTower(unittest.TestCase):
 
         norms = jnp.sqrt(jnp.sum(output**2, axis=-1))
         np.testing.assert_array_almost_equal(norms, jnp.ones_like(norms), decimal=5)
+
+    def test_mean_pooling_has_no_params(self):
+        """Test that mean pooling mode introduces no learned parameters."""
+        emb_size = 64
+        batch_size = 2
+        num_candidates = 4
+        num_hashes = 4
+
+        def forward(x):
+            tower = CandidateTower(emb_size=emb_size, enable_linear_proj=False)
+            return tower(x)
+
+        forward_fn = hk.without_apply_rng(hk.transform(forward))
+
+        rng = jax.random.PRNGKey(0)
+        x = jax.random.normal(rng, (batch_size, num_candidates, num_hashes, emb_size))
+
+        params = forward_fn.init(rng, x)
+        # Mean pooling should have no parameters
+        total_params = sum(p.size for p in jax.tree.leaves(params))
+        self.assertEqual(total_params, 0)
 
 
 class TestPhoenixRetrievalModel(unittest.TestCase):
@@ -131,6 +152,7 @@ class TestPhoenixRetrievalModel(unittest.TestCase):
             candidate_seq_len=self.candidate_seq_len,
             hash_config=self.hash_config,
             product_surface_vocab_size=16,
+            enable_linear_proj=True,
             model=TransformerConfig(
                 emb_size=self.emb_size,
                 widening_factor=2,
@@ -245,6 +267,42 @@ class TestPhoenixRetrievalModel(unittest.TestCase):
         for b in range(self.batch_size):
             scores = np.array(output.top_k_scores[b])
             self.assertTrue(np.all(scores[:-1] >= scores[1:]))
+
+    def test_mean_pooling_model_forward(self):
+        """Test model forward pass with mean pooling candidate tower."""
+        config = PhoenixRetrievalModelConfig(
+            emb_size=self.emb_size,
+            history_seq_len=self.history_seq_len,
+            candidate_seq_len=self.candidate_seq_len,
+            hash_config=self.hash_config,
+            product_surface_vocab_size=16,
+            enable_linear_proj=False,  # Mean pooling
+            model=TransformerConfig(
+                emb_size=self.emb_size,
+                widening_factor=2,
+                key_size=32,
+                num_q_heads=2,
+                num_kv_heads=2,
+                num_layers=1,
+                attn_output_multiplier=0.125,
+            ),
+        )
+
+        def forward(batch, embeddings, corpus_embeddings, top_k):
+            model = config.make()
+            return model(batch, embeddings, corpus_embeddings, top_k)
+
+        forward_fn = hk.without_apply_rng(hk.transform(forward))
+
+        batch, embeddings = self._create_test_batch()
+        corpus_embeddings, _ = self._create_test_corpus()
+
+        rng = jax.random.PRNGKey(0)
+        params = forward_fn.init(rng, batch, embeddings, corpus_embeddings, self.top_k)
+        output = forward_fn.apply(params, batch, embeddings, corpus_embeddings, self.top_k)
+
+        self.assertEqual(output.user_representation.shape, (self.batch_size, self.emb_size))
+        self.assertEqual(output.top_k_indices.shape, (self.batch_size, self.top_k))
 
 
 class TestRetrievalInferenceRunner(unittest.TestCase):

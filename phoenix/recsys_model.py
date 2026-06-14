@@ -24,9 +24,70 @@ from grok import (
     TransformerConfig,
     Transformer,
     layer_norm,
+    right_anchored_rope_positions,
 )
 
 logger = logging.getLogger(__name__)
+
+
+POST_AGE_MAX_MINUTES = 4800
+
+
+def compute_post_age_bucket(
+    impr_ts_sec: jax.Array,
+    post_creation_ts_sec: jax.Array,
+    granularity_mins: int = 60,
+) -> jax.Array:
+    """Compute post age buckets from impression and creation timestamps."""
+    num_normal_buckets = POST_AGE_MAX_MINUTES // granularity_mins
+    overflow_bucket = num_normal_buckets + 1
+
+    post_age_minutes = (impr_ts_sec - post_creation_ts_sec) // 60
+
+    bucket = (post_age_minutes // granularity_mins) + 1
+    bucket = jnp.clip(bucket, 0, overflow_bucket)
+
+    bucket = jnp.where(
+        (post_age_minutes < 0) | (impr_ts_sec == 0) | (post_creation_ts_sec == 0),
+        0,
+        bucket,
+    )
+    return bucket.astype(jnp.int32)
+
+
+@dataclass
+class NormConfig:
+    """Configuration for continuous value normalization."""
+
+    norm_scale: float = 30.0
+    use_log: bool = False
+
+
+@dataclass
+class ContinuousActionConfig:
+    """Configuration for a single continuous action loss (e.g., dwell time)."""
+
+    loss_weight: float = 0.0
+    loss_type: str = "mae"
+    tweedie_power: float = 1.5
+    norm_config: NormConfig = None  # type: ignore
+
+    def __post_init__(self):
+        if self.norm_config is None:
+            self.norm_config = NormConfig()
+
+
+def normalize_continuous_value(
+    values: jnp.ndarray,
+    config: NormConfig,
+) -> jnp.ndarray:
+    """Normalize continuous values to 0-1 range."""
+    values_clamped = jnp.clip(values, 0.0, config.norm_scale)
+
+    if config.use_log:
+        return jnp.log1p(values_clamped) / jnp.log1p(config.norm_scale)
+    else:
+        return values_clamped / config.norm_scale
 
 
 @dataclass
@@ -36,6 +97,7 @@ class HashConfig:
     num_user_hashes: int = 2
     num_item_hashes: int = 2
     num_author_hashes: int = 2
+    num_ip_hashes: int = 0
 
 
 @dataclass
@@ -51,12 +113,14 @@ class RecsysEmbeddings:
     candidate_post_embeddings: jax.typing.ArrayLike
     history_author_embeddings: jax.typing.ArrayLike
     candidate_author_embeddings: jax.typing.ArrayLike
+    user_ip_embeddings: Optional[jax.typing.ArrayLike] = None
 
 
 class RecsysModelOutput(NamedTuple):
     """Output of the recommendation model."""
 
     logits: jax.Array
+    continuous_preds: Optional[jax.Array] = None
 
 
 class RecsysBatch(NamedTuple):
@@ -74,6 +138,10 @@ class RecsysBatch(NamedTuple):
     candidate_post_hashes: jax.typing.ArrayLike
     candidate_author_hashes: jax.typing.ArrayLike
     candidate_product_surface: jax.typing.ArrayLike
+    history_continuous_actions: Optional[jax.typing.ArrayLike] = None
+    candidate_impr_ts: Optional[jax.typing.ArrayLike] = None
+    candidate_post_creation_ts: Optional[jax.typing.ArrayLike] = None
+    user_ip_hashes: Optional[jax.typing.ArrayLike] = None
 
 
 def block_user_reduce(
@@ -82,6 +150,9 @@ def block_user_reduce(
     num_user_hashes: int,
     emb_size: int,
     embed_init_scale: float = 1.0,
+    *,
+    user_ip_embeddings: Optional[jnp.ndarray] = None,
+    num_ip_hashes: int = 0,
 ) -> Tuple[jax.Array, jax.Array]:
     """Combine multiple user hash embeddings into a single user representation.
 
@@ -91,6 +162,8 @@ def block_user_reduce(
         num_user_hashes: number of hash functions used
         emb_size: embedding dimension D
         embed_init_scale: initialization scale for projection
+        user_ip_embeddings: optional [B, num_ip_hashes, D] IP address embeddings
+        num_ip_hashes: number of IP hash functions (0 = disabled)
 
     Returns:
         user_embedding: [B, 1, D] - combined user embedding
@@ -114,6 +187,11 @@ def block_user_reduce(
     )
 
     # hash 0 is reserved for padding)
+    if user_ip_embeddings is not None and num_ip_hashes > 0:
+        ip_emb = user_ip_embeddings.reshape((B, num_ip_hashes, D))
+        ip_emb = jnp.sum(ip_emb, axis=1, keepdims=True)  # [B, 1, D]
+        user_embedding = user_embedding + ip_emb
+
     user_padding_mask = (user_hashes[:, 0] != 0).reshape(B, 1).astype(jnp.bool_)
 
     return user_embedding, user_padding_mask
@@ -128,8 +206,11 @@ def block_history_reduce(
     num_item_hashes: int,
     num_author_hashes: int,
     embed_init_scale: float = 1.0,
+    *,
+    history_continuous_embeddings: Optional[jnp.ndarray] = None,
+    history_post_age_embeddings: Optional[jnp.ndarray] = None,
 ) -> Tuple[jax.Array, jax.Array]:
-    """Combine history embeddings (post, author, actions, product_surface) into sequence.
+    """Combine history embeddings (post, author, actions, product_surface, ...) into sequence.
 
     Args:
         history_post_hashes: [B, S, num_item_hashes]
@@ -139,8 +220,9 @@ def block_history_reduce(
         history_actions_embeddings: [B, S, D]
         num_item_hashes: number of hash functions for items
         num_author_hashes: number of hash functions for authors
-        emb_size: embedding dimension D
         embed_init_scale: initialization scale
+        history_continuous_embeddings: optional [B, S, D] continuous action embeddings
+        history_post_age_embeddings: optional [B, S, D] post age embeddings
 
     Returns:
         history_embeddings: [B, S, D]
@@ -153,15 +235,19 @@ def block_history_reduce(
         (B, S, num_author_hashes * D)
     )
 
-    post_author_embedding = jnp.concatenate(
-        [
-            history_post_embeddings_reshaped,
-            history_author_embeddings_reshaped,
-            history_actions_embeddings,
-            history_product_surface_embeddings,
-        ],
-        axis=-1,
-    )
+    parts = [
+        history_post_embeddings_reshaped,
+        history_author_embeddings_reshaped,
+        history_actions_embeddings,
+        history_product_surface_embeddings,
+    ]
+
+    if history_continuous_embeddings is not None:
+        parts.append(history_continuous_embeddings)
+    if history_post_age_embeddings is not None:
+        parts.append(history_post_age_embeddings)
+
+    post_author_embedding = jnp.concatenate(parts, axis=-1)
 
     embed_init = hk.initializers.VarianceScaling(embed_init_scale, mode="fan_out")
     proj_mat_3 = hk.get_parameter(
@@ -190,8 +276,10 @@ def block_candidate_reduce(
     num_item_hashes: int,
     num_author_hashes: int,
     embed_init_scale: float = 1.0,
+    *,
+    candidate_post_age_embeddings: Optional[jnp.ndarray] = None,
 ) -> Tuple[jax.Array, jax.Array]:
-    """Combine candidate embeddings (post, author, product_surface) into sequence.
+    """Combine candidate embeddings (post, author, product_surface, ...) into sequence.
 
     Args:
         candidate_post_hashes: [B, C, num_item_hashes]
@@ -200,8 +288,8 @@ def block_candidate_reduce(
         candidate_product_surface_embeddings: [B, C, D]
         num_item_hashes: number of hash functions for items
         num_author_hashes: number of hash functions for authors
-        emb_size: embedding dimension D
         embed_init_scale: initialization scale
+        candidate_post_age_embeddings: optional [B, C, D] post age embeddings
 
     Returns:
         candidate_embeddings: [B, C, D]
@@ -216,14 +304,16 @@ def block_candidate_reduce(
         (B, C, num_author_hashes * D)
     )
 
-    post_author_embedding = jnp.concatenate(
-        [
-            candidate_post_embeddings_reshaped,
-            candidate_author_embeddings_reshaped,
-            candidate_product_surface_embeddings,
-        ],
-        axis=-1,
-    )
+    parts = [
+        candidate_post_embeddings_reshaped,
+        candidate_author_embeddings_reshaped,
+        candidate_product_surface_embeddings,
+    ]
+
+    if candidate_post_age_embeddings is not None:
+        parts.append(candidate_post_age_embeddings)
+
+    post_author_embedding = jnp.concatenate(parts, axis=-1)
 
     embed_init = hk.initializers.VarianceScaling(embed_init_scale, mode="fan_out")
     proj_mat_2 = hk.get_parameter(
@@ -259,11 +349,32 @@ class PhoenixModelConfig:
 
     product_surface_vocab_size: int = 16
 
+    post_age_granularity_mins: int = 60
+
+    num_continuous_actions: int = 8
+
+    continuous_action_hidden_dim: int = 64
+
+    continuous_action_config: ContinuousActionConfig = None  # type: ignore
+
+    use_ip_address: bool = False
+
+    right_anchored_rope: bool = False
+
+    mask_neg_feedback_on_negatives: bool = True
+
     _initialized = False
 
     def __post_init__(self):
         if self.hash_config is None:
             self.hash_config = HashConfig()
+        if self.continuous_action_config is None:
+            self.continuous_action_config = ContinuousActionConfig()
+
+    @property
+    def post_age_vocab_size(self) -> int:
+        """Derived vocab size for post age buckets: num_normal + overflow + missing."""
+        return (POST_AGE_MAX_MINUTES // self.post_age_granularity_mins) + 2
 
     def initialize(self):
         self._initialized = True
@@ -351,7 +462,7 @@ class PhoenixModel(hk.Module):
         return output.astype(self.fprop_dtype)
 
     def _get_unembedding(self) -> jax.Array:
-        """Get the unembedding matrix for decoding to logits."""
+        """Get the unembedding matrix for decoding to discrete action logits."""
         config = self.config
         embed_init = hk.initializers.VarianceScaling(1.0, mode="fan_out")
         unembed_mat = hk.get_parameter(
@@ -361,6 +472,50 @@ class PhoenixModel(hk.Module):
             init=embed_init,
         )
         return unembed_mat
+
+    def _get_continuous_head(self) -> jax.Array:
+        config = self.config
+        embed_init = hk.initializers.VarianceScaling(1.0, mode="fan_out")
+        continuous_mat = hk.get_parameter(
+            "continuous_unembeddings",
+            [config.emb_size, config.num_continuous_actions],
+            dtype=jnp.float32,
+            init=embed_init,
+        )
+        return continuous_mat
+
+    def _project_continuous_value_to_embedding(
+        self,
+        values: jnp.ndarray,
+        D: int,
+        param_name: str,
+        norm_config: NormConfig,
+        hidden_dim: int = 64,
+    ) -> jax.Array:
+        values_normalized = normalize_continuous_value(values, norm_config)
+        values_expanded = values_normalized[..., None]  # [B, seq_len, 1]
+
+        embed_init = hk.initializers.VarianceScaling(1.0, mode="fan_out")
+
+        proj1 = hk.get_parameter(
+            f"{param_name}_proj1",
+            [1, hidden_dim],
+            dtype=jnp.float32,
+            init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
+        )
+        hidden = jnp.dot(values_expanded.astype(proj1.dtype), proj1)
+
+        hidden = jax.nn.gelu(hidden)
+
+        proj2 = hk.get_parameter(
+            f"{param_name}_proj2",
+            [hidden_dim, D],
+            dtype=jnp.float32,
+            init=lambda shape, dtype: embed_init(list(reversed(shape)), dtype).T,
+        )
+        embedding = jnp.dot(hidden, proj2)
+
+        return embedding.astype(self.fprop_dtype)
 
     def build_inputs(
         self,
@@ -396,12 +551,28 @@ class PhoenixModel(hk.Module):
 
         history_actions_embeddings = self._get_action_embeddings(batch.history_actions)  # type: ignore
 
+        B_size = batch.history_product_surface.shape[0]  # type: ignore
+        S_size = batch.history_product_surface.shape[1]  # type: ignore
+        if batch.history_continuous_actions is not None:
+            dwell_values = batch.history_continuous_actions[:, :, 1]  # index 1 = dwell_time
+        else:
+            dwell_values = jnp.zeros((B_size, S_size), dtype=jnp.float32)
+        history_continuous_embeddings = self._project_continuous_value_to_embedding(
+            dwell_values,
+            config.emb_size,
+            "history_dwell_time",
+            config.continuous_action_config.norm_config,
+            config.continuous_action_hidden_dim,
+        )
+
         user_embeddings, user_padding_mask = block_user_reduce(
             batch.user_hashes,  # type: ignore
             recsys_embeddings.user_embeddings,  # type: ignore
             hash_config.num_user_hashes,
             config.emb_size,
             1.0,
+            user_ip_embeddings=recsys_embeddings.user_ip_embeddings,
+            num_ip_hashes=hash_config.num_ip_hashes,
         )
 
         history_embeddings, history_padding_mask = block_history_reduce(
@@ -413,6 +584,23 @@ class PhoenixModel(hk.Module):
             hash_config.num_item_hashes,
             hash_config.num_author_hashes,
             1.0,
+            history_continuous_embeddings=history_continuous_embeddings,
+        )
+
+        C_size = batch.candidate_product_surface.shape[1]  # type: ignore
+        if batch.candidate_impr_ts is not None and batch.candidate_post_creation_ts is not None:
+            post_age_buckets = compute_post_age_bucket(
+                batch.candidate_impr_ts,
+                batch.candidate_post_creation_ts,
+                config.post_age_granularity_mins,
+            )
+        else:
+            post_age_buckets = jnp.zeros((B_size, C_size), dtype=jnp.int32)
+        candidate_post_age_embeddings = self._single_hot_to_embeddings(
+            post_age_buckets,
+            config.post_age_vocab_size,
+            config.emb_size,
+            "post_age_embedding_table",
         )
 
         candidate_embeddings, candidate_padding_mask = block_candidate_reduce(
@@ -423,6 +611,7 @@ class PhoenixModel(hk.Module):
             hash_config.num_item_hashes,
             hash_config.num_author_hashes,
             1.0,
+            candidate_post_age_embeddings=candidate_post_age_embeddings,
         )
 
         embeddings = jnp.concatenate(
@@ -448,17 +637,28 @@ class PhoenixModel(hk.Module):
             recsys_embeddings: RecsysEmbeddings containing pre-looked-up embeddings
 
         Returns:
-            RecsysModelOutput containing logits for each candidate. Shape = [B, num_candidates, num_actions]
+            RecsysModelOutput containing:
+                - logits: [B, num_candidates, num_actions] discrete engagement logits
+                - continuous_preds: [B, num_candidates, num_continuous] continuous predictions
         """
         embeddings, padding_mask, candidate_start_offset = self.build_inputs(
             batch, recsys_embeddings
         )
+
+        positions = None
+        if self.config.right_anchored_rope:
+            positions = right_anchored_rope_positions(
+                padding_mask,
+                history_seq_len=self.config.history_seq_len,
+                num_user_prefix_tokens=1,
+            )
 
         # transformer
         model_output = self.model(
             embeddings,
             padding_mask,
             candidate_start_offset=candidate_start_offset,
+            positions=positions,
         )
 
         out_embeddings = model_output.embeddings
@@ -471,4 +671,10 @@ class PhoenixModel(hk.Module):
         logits = jnp.dot(candidate_embeddings.astype(unembeddings.dtype), unembeddings)
         logits = logits.astype(self.fprop_dtype)
 
-        return RecsysModelOutput(logits=logits)
+        continuous_mat = self._get_continuous_head()
+        continuous_logits = jnp.dot(
+            candidate_embeddings.astype(continuous_mat.dtype), continuous_mat
+        )
+        continuous_preds = jax.nn.sigmoid(continuous_logits).astype(self.fprop_dtype)
+
+        return RecsysModelOutput(logits=logits, continuous_preds=continuous_preds)
